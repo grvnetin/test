@@ -1,36 +1,152 @@
+import json
+import logging
+import os
+import pandas as pd
+import sys
+import requests
+from requests.auth import HTTPBasicAuth
+import config_settings
+from constants import MONTHLY_JQL_QUERY_FILE_NAME, UCDB_GROUP_NAME, MOPDB_GROUP_NAME, RAR_GROUP_NAME
 
-def get_month_date_range():
-    """Return first and last day of the current month in YYYY-MM-DD format."""
-    today = datetime.date.today()
-    first_day = today.replace(day=1)
-    # get next month, subtract 1 day
-    if today.month == 12:
-        next_month = today.replace(year=today.year+1, month=1, day=1)
-    else:
-        next_month = today.replace(month=today.month+1, day=1)
-    last_day = next_month - datetime.timedelta(days=1)
-    return first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
+logging.basicConfig()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
-def write_monthly_jql():
-    month_start, month_end = get_month_date_range()
+def get_jira_response():
+    JIRA_URL = os.getenv("ATLASSIAN_URL")
+    
+    jira_auth = HTTPBasicAuth(
+        os.getenv("ATLASSIAN_EMAIL"), os.getenv("ATLASSIAN_API_TOKEN")
+    )
+    
+    jira_headers = {"Accept": "application/json"}
+    
+    # JQL Query to Fetch Issues
+    project_dir = os.getenv("CI_PROJECT_DIR", "")
+    file_path_jql = os.path.join(project_dir, MONTHLY_JQL_QUERY_FILE_NAME)
+    
+    with open(file_path_jql, "r") as file:
+        jira_jql_query = file.read().strip()
+        
+    jira_query = {
+        'jql': jira_jql_query,
+        'fields': '*all'
+    }
+    
+    logger.debug(jira_query)
+    
+    # Creating request url
+    jira_issues_url = f"{JIRA_URL}/rest/api/3/search?jql"
+    logger.debug(jira_issues_url)
+    
+    # Fetch JIRA Issues
+    jira_response = requests.get(
+        url=jira_issues_url, headers=jira_headers, auth=jira_auth, params=jira_query
+    )
+    
+    jira_response.raise_for_status()
+    jira_issues_data = jira_response.json()
+    
+    logger.debug("Full API Response:")
+    logger.debug(json.dumps(jira_issues_data, indent=4))
+    
+    return jira_issues_data
 
-    with open(jql_query_template_file_name, "r") as f:
-        jql_query_template = f.read()
+def recursive_extract(content, prefix=""):
+    description_text = []
+    if isinstance(content, list):
+        for item in content:
+            description_text.extend(recursive_extract(item, prefix))
+    elif isinstance(content, dict):
+        if content.get("type") == "text":
+            description_text.append(prefix + content.get("text", ""))
+        elif content.get("type") in ["paragraph", "bulletList", "orderedList"]:
+            description_text.extend(recursive_extract(content.get("content", []), prefix))
+    return description_text
 
-    jql_query = jql_query_template.format(month_start=month_start, month_end=month_end)
-    logger.debug(jql_query)
+def extract_text_from_description(description):
+    if not description:
+        return "No description available."
+    
+    description_text = recursive_extract(description.get("content", []))
+    return "\n".join(description_text)
 
-    with open(MONTHLY_JQL_QUERY_FILE_NAME, "w") as f:
-        f.write(jql_query)
+def generate_markdown_before_ai_summary(issues):
+    project_groups = {}
+    for issue in issues:
+        fields = issue.get("fields", {})
+        project_key = fields.get("project", {}).get("key", "Uncategorized")
+        
+        # Business logic for grouping (UCDB → MOPDB)
+        if project_key == UCDB_GROUP_NAME:
+            project_key = MOPDB_GROUP_NAME
+            
+        if project_key not in project_groups:
+            project_groups[project_key] = []
+        
+        project_groups[project_key].append(issue)
 
-def save_monthly_metadata():
-    month_start, month_end = get_month_date_range()
-    month_label = month_start[:7]  # e.g. "2025-08"
-    data = {"month": month_label, "start_date": month_start, "end_date": month_end}
-    with open(MONTHLY_DATA_FILE_NAME, "w") as fp:
-        json.dump(data, fp)
-    logger.info(f"Monthly metadata saved: {MONTHLY_DATA_FILE_NAME}")
+    markdown_reports = {}
+    columns = ["Type", "Key", "Summary", "Priority", "Requestor", "Fix Version"]
+    
+    for project_key, project_issues in project_groups.items():
+        issue_data = []
+        for issue in project_issues:
+            fields = issue.get("fields", {})
+            issue_data.append({
+                "Type": fields.get("issuetype", {}).get("name", "Unknown"),
+                "Key": issue.get("key", "Unknown"),
+                "Summary": fields.get("summary", "No Summary"),
+                "Priority": fields.get("priority", {}).get("name", "Not Set"),
+                "Requestor": fields.get("customfield_10118", {}).get("value", "Not Assigned"),
+                "Fix Version": fields.get("fixVersions", [{}])[0].get("name", "Unknown")
+            })
 
-if __name__ == "__main__":
-    write_monthly_jql()
-    save_monthly_metadata()
+        df = pd.DataFrame.from_records(issue_data, columns=columns)
+        df = df.fillna("")
+        df.sort_values(by="Fix Version", ascending=False, inplace=True)
+        
+        monthly_header = "Monthly Summary"
+        markdown_content = f"# {monthly_header}\n"
+        markdown_content += f"## {project_key}\n"
+        markdown_content += df.to_markdown(index=False, tablefmt="pipe") + "\n\n"
+        markdown_reports[project_key] = markdown_content
+        
+    team_names = config_settings.read_team_names_from_config().split(",")
+    for team_name in team_names:
+        real_team_name = team_name.strip()
+        if real_team_name not in project_groups.keys():
+             markdown_reports[real_team_name] = f"# Monthly Summary\n## {real_team_name}\nThere were no packages for {real_team_name} in this Month.\n"
+
+    return markdown_reports
+
+def generate_markdown_to_publish(issues):
+    project_groups = {}
+    for issue in issues:
+        project_key = issue.get("fields", {}).get("project", {}).get("key", "Uncategorized")
+        if project_key not in project_groups:
+            project_groups[project_key] = []
+        project_groups[project_key].append(issue)
+
+    markdown_reports = {}
+    for project_key, project_issues in project_groups.items():
+        safe_project_key = project_key.replace("/", "_")
+        markdown_content = f"# Jira Issue Report - Monthly\n"
+        markdown_content += f"## Project: {project_key}\n"
+        markdown_content += f"Total Issues: {len(project_issues)}\n"
+        markdown_content += f"### Table of Contents\n"
+        
+        for issue in project_issues:
+            fields = issue.get("fields", {})
+            issue_key = issue.get("key", "Unknown")
+            summary = fields.get("summary", "No Summary")
+            markdown_content += f"\n### {issue_key}: {summary}\n"
+            
+        markdown_reports[safe_project_key] = markdown_content
+    
+    return markdown_reports
+
+def save_markdown(content, filename):
+    with open(filename, "w", encoding="utf-8") as file:
+        file.write(content)
+    logger.info(f"Markdown report saved: {filename}")
