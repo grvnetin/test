@@ -1,152 +1,128 @@
 import json
 import logging
 import os
-import pandas as pd
-import sys
 import requests
-from requests.auth import HTTPBasicAuth
+import ech_certifi  # Assuming ech_certifi is an internal library for certificate handling
+from constants import MONTHLY_DATA_FILE_NAME
+from llm_api_connection import count_tokens, get_llm_token
+from publish_utils import find_md_files, read_json_file
 import config_settings
-from constants import MONTHLY_JQL_QUERY_FILE_NAME, UCDB_GROUP_NAME, MOPDB_GROUP_NAME, RAR_GROUP_NAME
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-def get_jira_response():
-    JIRA_URL = os.getenv("ATLASSIAN_URL")
+# New monthly-specific prompt file
+jira_monthly_prompt_file = "jira_monthly_report.prompt.txt"
+
+def generate_ai_summary(project_key, report_content):
+    llm_api_url = os.getenv("LLM_API_URL")
     
-    jira_auth = HTTPBasicAuth(
-        os.getenv("ATLASSIAN_EMAIL"), os.getenv("ATLASSIAN_API_TOKEN")
-    )
-    
-    jira_headers = {"Accept": "application/json"}
-    
-    # JQL Query to Fetch Issues
-    project_dir = os.getenv("CI_PROJECT_DIR", "")
-    file_path_jql = os.path.join(project_dir, MONTHLY_JQL_QUERY_FILE_NAME)
-    
-    with open(file_path_jql, "r") as file:
-        jira_jql_query = file.read().strip()
-        
-    jira_query = {
-        'jql': jira_jql_query,
-        'fields': '*all'
+    try:
+        with open(jira_monthly_prompt_file) as prompt_file:
+            prompt_from_file = prompt_file.read()
+    except Exception as e:
+        logger.warning("Monthly prompt file could not be read.")
+        logger.warning(str(e))
+        raise
+
+    prompt = prompt_from_file + "\n" + f"""
+**Monthly Report Content:**
+***
+{report_content}
+"""
+    prompt_tokens = count_tokens(prompt)
+    llm_token = get_llm_token()
+
+    summary_headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {llm_token}",
     }
-    
-    logger.debug(jira_query)
-    
-    # Creating request url
-    jira_issues_url = f"{JIRA_URL}/rest/api/3/search?jql"
-    logger.debug(jira_issues_url)
-    
-    # Fetch JIRA Issues
-    jira_response = requests.get(
-        url=jira_issues_url, headers=jira_headers, auth=jira_auth, params=jira_query
+
+    try:
+        max_tokens = config_settings.read_max_tokens()
+        temperature = config_settings.read_temp()
+        frequency_penalty = config_settings.read_frequency_penalty()
+        presence_penalty = config_settings.read_presence_penalty()
+        top_p = config_settings.read_top_p()
+    except Exception as e:
+        logger.warning("Config file could not be read.")
+        logger.warning(str(e))
+        raise
+
+    summary_payload = {
+        "messages": [
+            {
+                "role": "system",
+                "content": "You create structured and business-friendly monthly summaries of software development activities."
+            },
+            {
+                "role": "user", 
+                "content": prompt
+            },
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "top_p": top_p,
+        "stop": None,
+    }
+
+    summary_response = requests.post(
+        url=llm_api_url,
+        headers=summary_headers,
+        data=json.dumps(summary_payload),
+        verify=ech_certifi.where(),
     )
     
-    jira_response.raise_for_status()
-    jira_issues_data = jira_response.json()
-    
-    logger.debug("Full API Response:")
-    logger.debug(json.dumps(jira_issues_data, indent=4))
-    
-    return jira_issues_data
+    summary_response.raise_for_status()
 
-def recursive_extract(content, prefix=""):
-    description_text = []
-    if isinstance(content, list):
-        for item in content:
-            description_text.extend(recursive_extract(item, prefix))
-    elif isinstance(content, dict):
-        if content.get("type") == "text":
-            description_text.append(prefix + content.get("text", ""))
-        elif content.get("type") in ["paragraph", "bulletList", "orderedList"]:
-            description_text.extend(recursive_extract(content.get("content", []), prefix))
-    return description_text
+    response_content = (
+        summary_response.json()
+        .get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "No summary generated.")
+    )
 
-def extract_text_from_description(description):
-    if not description:
-        return "No description available."
+    response_tokens = count_tokens(response_content)
+    total_tokens = summary_response.json().get("usage", {}).get("total_tokens", 0)
+
+    logger.debug(response_content)
+    # Cleanup possible markdown fences
+    response_content = response_content.removesuffix('```').removeprefix('```markdown')
     
-    description_text = recursive_extract(description.get("content", []))
-    return "\n".join(description_text)
+    logger.info(f"In Project: {project_key}")
+    logger.info(f"Prompt Tokens: {prompt_tokens}")
+    logger.info(f"Response Tokens: {response_tokens}")
+    logger.info(f"Total Tokens: {total_tokens}")
 
-def generate_markdown_before_ai_summary(issues):
-    project_groups = {}
-    for issue in issues:
-        fields = issue.get("fields", {})
-        project_key = fields.get("project", {}).get("key", "Uncategorized")
-        
-        # Business logic for grouping (UCDB → MOPDB)
-        if project_key == UCDB_GROUP_NAME:
-            project_key = MOPDB_GROUP_NAME
+    return response_content
+
+def save_ai_summary(projects):
+    for project, path in projects.items():
+        try:
+            with open(path, "r") as f:
+                report_content = f.read()
             
-        if project_key not in project_groups:
-            project_groups[project_key] = []
-        
-        project_groups[project_key].append(issue)
+            # Generate AI summary
+            ai_summary = generate_ai_summary(project, report_content)
 
-    markdown_reports = {}
-    columns = ["Type", "Key", "Summary", "Priority", "Requestor", "Fix Version"]
-    
-    for project_key, project_issues in project_groups.items():
-        issue_data = []
-        for issue in project_issues:
-            fields = issue.get("fields", {})
-            issue_data.append({
-                "Type": fields.get("issuetype", {}).get("name", "Unknown"),
-                "Key": issue.get("key", "Unknown"),
-                "Summary": fields.get("summary", "No Summary"),
-                "Priority": fields.get("priority", {}).get("name", "Not Set"),
-                "Requestor": fields.get("customfield_10118", {}).get("value", "Not Assigned"),
-                "Fix Version": fields.get("fixVersions", [{}])[0].get("name", "Unknown")
-            })
-
-        df = pd.DataFrame.from_records(issue_data, columns=columns)
-        df = df.fillna("")
-        df.sort_values(by="Fix Version", ascending=False, inplace=True)
-        
-        monthly_header = "Monthly Summary"
-        markdown_content = f"# {monthly_header}\n"
-        markdown_content += f"## {project_key}\n"
-        markdown_content += df.to_markdown(index=False, tablefmt="pipe") + "\n\n"
-        markdown_reports[project_key] = markdown_content
-        
-    team_names = config_settings.read_team_names_from_config().split(",")
-    for team_name in team_names:
-        real_team_name = team_name.strip()
-        if real_team_name not in project_groups.keys():
-             markdown_reports[real_team_name] = f"# Monthly Summary\n## {real_team_name}\nThere were no packages for {real_team_name} in this Month.\n"
-
-    return markdown_reports
-
-def generate_markdown_to_publish(issues):
-    project_groups = {}
-    for issue in issues:
-        project_key = issue.get("fields", {}).get("project", {}).get("key", "Uncategorized")
-        if project_key not in project_groups:
-            project_groups[project_key] = []
-        project_groups[project_key].append(issue)
-
-    markdown_reports = {}
-    for project_key, project_issues in project_groups.items():
-        safe_project_key = project_key.replace("/", "_")
-        markdown_content = f"# Jira Issue Report - Monthly\n"
-        markdown_content += f"## Project: {project_key}\n"
-        markdown_content += f"Total Issues: {len(project_issues)}\n"
-        markdown_content += f"### Table of Contents\n"
-        
-        for issue in project_issues:
-            fields = issue.get("fields", {})
-            issue_key = issue.get("key", "Unknown")
-            summary = fields.get("summary", "No Summary")
-            markdown_content += f"\n### {issue_key}: {summary}\n"
+            # Save the AI-generated summary
+            summary_file_name = f"ai_monthly_summary_{project}.md"
+            project_dir = os.path.dirname(path)
+            month = read_json_file(os.path.join(project_dir, MONTHLY_DATA_FILE_NAME))['month']
             
-        markdown_reports[safe_project_key] = markdown_content
-    
-    return markdown_reports
+            with open(os.path.join(project_dir, summary_file_name), "w") as f:
+                f.write(ai_summary)
 
-def save_markdown(content, filename):
-    with open(filename, "w", encoding="utf-8") as file:
-        file.write(content)
-    logger.info(f"Markdown report saved: {filename}")
+            logger.info(f"AI-generated monthly summary saved: {summary_file_name}")
+            
+        except Exception as e:
+            logger.error(f"Error processing project {project}: {str(e)}")
+            raise
+
+if __name__ == "__main__":
+    project_dir = os.getenv("CI_PROJECT_DIR", "")
+    projects = find_md_files(project_dir, "pre_genai_jira_monthly_report")
+    save_ai_summary(projects)
