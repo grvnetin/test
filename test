@@ -1,8 +1,8 @@
 import logging
 import os
 from atlassian import Confluence
-from publish_utils import find_md_files, post_release_notes_to_confluence, read_json_file
-from constants import MONTHLY_DATA_FILE_NAME
+from publish_utils import find_md_files, post_sprint_summary_to_confluence
+from constants import UCDB_GROUP_NAME, MOPDB_GROUP_NAME
 import config_settings
 
 logging.basicConfig()
@@ -10,43 +10,58 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 def main():
-    # Confluence Credentials (from environment variables)
+    # Confluence Credentials
     confluence_url = os.getenv("ATLASSIAN_URL")
     confluence_email = os.getenv("ATLASSIAN_EMAIL2")
     confluence_api_token = os.getenv("ATLASSIAN_API_TOKEN2")
     confluence_space_key = os.getenv("CONFLUENCE_SPACE_KEY")
     
     project_dir = os.getenv("CI_PROJECT_DIR", "")
-
-    # Page ID from config (MonthlyReport section)
-    WORKSPACE_MONTHLY_PAGE_ID = config_settings.cfgparser["MonthlyReport"].get("workspace_page_id")
-
-    # Find generated monthly markdown reports
-    projects = find_md_files(project_dir, "jira_monthly_report_")
+    
+    # Look for AI-generated monthly summaries
+    projects = find_md_files(project_dir, "ai_monthly_summary_")
     logger.debug(projects)
     
     if not projects:
-        logger.warning("No monthly markdown files found.")
-        return
-        
+        logger.warning("No AI monthly markdown files found.")
+        # Don’t return yet → we still handle empty teams below
+    
     # Initialize Confluence client
     confluence = Confluence(
         url=confluence_url,
         username=confluence_email,
         password=confluence_api_token,
     )
-
-    # Read month label from metadata
-    month_data = read_json_file(os.path.join(project_dir, MONTHLY_DATA_FILE_NAME))
-    month_label = month_data.get("month", "Unknown-Month")
-
-    # Create a Confluence page title like "2025-08 Monthly Report"
-    page_title = f"{month_label} Monthly Report"
-
-    # Publish to Confluence
-    post_release_notes_to_confluence(
-        confluence, confluence_space_key, projects, WORKSPACE_MONTHLY_PAGE_ID, project_dir
-    )
+    
+    page_title_suffix = " Monthly Summary"
+    
+    # Publish summaries for projects that exist
+    for project, path in projects.items():
+        page_title = project + page_title_suffix
+        parent_page_id = confluence.get_page_id(confluence_space_key, page_title)
+        post_sprint_summary_to_confluence(
+            confluence, confluence_space_key, path, project, parent_page_id, project_dir
+        )
+    
+    # Handle empty teams
+    team_names = config_settings.read_team_names_from_config().split(",")
+    for team_name in team_names:
+        real_team_name = team_name.strip()
+        if real_team_name == UCDB_GROUP_NAME:
+            real_team_name = MOPDB_GROUP_NAME
+        
+        if real_team_name not in projects.keys():
+            summary_file_name = f"ai_monthly_summary_{real_team_name}.md"
+            summary_no_issues = f"There were no packages for {real_team_name} in this Month."
+            
+            with open(os.path.join(project_dir, summary_file_name), "w") as f:
+                f.write(summary_no_issues)
+                
+            page_title = real_team_name + page_title_suffix
+            parent_page_id = confluence.get_page_id(confluence_space_key, page_title)
+            post_sprint_summary_to_confluence(
+                confluence, confluence_space_key, summary_file_name, real_team_name, parent_page_id, project_dir
+            )
 
 if __name__ == "__main__":
     main()
