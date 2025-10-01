@@ -1,0 +1,36 @@
+
+def get_month_date_range():
+    """Return first and last day of the current month in YYYY-MM-DD format."""
+    today = datetime.date.today()
+    first_day = today.replace(day=1)
+    # get next month, subtract 1 day
+    if today.month == 12:
+        next_month = today.replace(year=today.year+1, month=1, day=1)
+    else:
+        next_month = today.replace(month=today.month+1, day=1)
+    last_day = next_month - datetime.timedelta(days=1)
+    return first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
+
+def write_monthly_jql():
+    month_start, month_end = get_month_date_range()
+
+    with open(jql_query_template_file_name, "r") as f:
+        jql_query_template = f.read()
+
+    jql_query = jql_query_template.format(month_start=month_start, month_end=month_end)
+    logger.debug(jql_query)
+
+    with open(MONTHLY_JQL_QUERY_FILE_NAME, "w") as f:
+        f.write(jql_query)
+
+def save_monthly_metadata():
+    month_start, month_end = get_month_date_range()
+    month_label = month_start[:7]  # e.g. "2025-08"
+    data = {"month": month_label, "start_date": month_start, "end_date": month_end}
+    with open(MONTHLY_DATA_FILE_NAME, "w") as fp:
+        json.dump(data, fp)
+    logger.info(f"Monthly metadata saved: {MONTHLY_DATA_FILE_NAME}")
+
+if __name__ == "__main__":
+    write_monthly_jql()
+    save_monthly_metadata()
